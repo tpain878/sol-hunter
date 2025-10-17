@@ -1,9 +1,26 @@
 ﻿from fastapi import FastAPI
-import os, json, redis
+import os, json, redis, asyncio, random, time
 
 app = FastAPI()
 r = redis.Redis.from_url(os.getenv("UPSTASH_REDIS_URL"), decode_responses=True)
 
+# ---- background feeder (runs every 60s) ----
+async def feeder():
+    while True:
+        s = random.randint(70, 95)
+        mint = f"DUMMY{int(time.time())}"
+        card = {"token":{"symbol":"FAKE","mint":mint,"decimals":9},
+                "why_now":["buyers up","lp locked","route stable"],
+                "score":{"total":s}}
+        r.set(f"card:{mint}", json.dumps(card))
+        r.zadd("candidates", {mint: s})
+        await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def start_feeder():
+    asyncio.create_task(feeder())
+
+# ---- API ----
 @app.get("/health")
 def health():
     return {"env":{
