@@ -1,0 +1,35 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Sol Hunter API", "version": "1.0.0", "description": "Scan and evaluate Solana meme-coin candidates." },
+  "servers": [{ "url": "https://memecoin-qv75.onrender.com" }],
+  "paths": {
+    "/scan": {
+      "get": {
+        "summary": "Get top candidates",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10, "minimum": 1, "maximum": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of candidate cards",
+            "content": { "application/json": { "schema": { "type": "array", "items": { "type": "object" } } } }
+          }
+        }
+      }
+    },
+    "/evaluate": {
+      "get": {
+        "summary": "Evaluate one mint",
+        "parameters": [
+          { "name": "mint", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Evaluation card",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    }
+  }
+}
