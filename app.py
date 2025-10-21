@@ -24,9 +24,7 @@ async def feeder():
         r.zadd("candidates", {mint: s})
         await asyncio.sleep(60)
 
-@app.on_event("startup")
-async def start_feeder():
-    asyncio.create_task(feeder())
+
 
 @app.get("/health")
 def health():
@@ -51,29 +49,3 @@ import os, json, time, random
 
 FEED_KEY = os.getenv("FEED_KEY", "")
 
-@app.post("/feed")
-async def feed(request: Request):
-    # simple header check
-    if request.headers.get("x-api-key") != FEED_KEY:
-        raise HTTPException(status_code=401, detail="bad key")
-
-    payload = await request.json()
-    # expected minimal fields; fallback if not provided
-    mint = payload.get("mint") or f"DUMMY{int(time.time())}"
-    score = payload.get("score") or random.randint(70, 95)
-    card = payload.get("card") or {
-        "token": {"symbol": "FAKE", "mint": mint, "decimals": 9},
-        "why_now": ["buyers up", "lp locked", "route stable"],
-        "score": {"total": score},
-        "plan": {
-            "position_pct": 0.0075, "max_slippage_pct": 1.2,
-            "expected_impact_pct": 1.3, "router": "Jupiter"
-        },
-        "exits": {"tp_levels_pct": [50, 100, 200]},
-        "ops": {"pre_trade_checks": ["dust_ok"], "post_trade": ["journal"]}
-    }
-
-    # write into Redis (same keys used by /scan and /evaluate)
-    r.set(f"card:{mint}", json.dumps(card))
-    r.zadd("candidates", {mint: score})
-    return {"ok": True, "mint": mint, "score": score}
