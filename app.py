@@ -1,51 +1,89 @@
-from fastapi import FastAPI, HTTPException, Request
-import json, redis, asyncio, random, time
+from fastapi import FastAPI
+import os, json, redis
 
-# === YOUR REAL REDIS URL (TLS) ===
-REDIS_URL = "rediss://default:AWDJAAIncDJiYzA2YjM4NTliYzU0NzY3OWYwNzFhNzQ3YzQ4ZTBhOXAyMjQ3Nzc@keen-ferret-24777.upstash.io:6379"
+# --- Redis connection ---
+# We try env var first (Render should have UPSTASH_REDIS_URL set).
+# If it's not set in env, we fall back to your known URL.
+REDIS_URL = os.getenv(
+    "UPSTASH_REDIS_URL",
+    "rediss://default:AWDJAAIncDJiYzA2YjM4NTliYzU0NzY3OWYwNzFhNzQ3YzQ4ZTBhOXAyMjQ3Nzc@keen-ferret-24777.upstash.io:6379"
+)
 
-app = FastAPI()
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-# ---- background feeder (every 60s) ----
-async def feeder():
-    while True:
-        s = random.randint(70, 95)
-        mint = f"DUMMY{int(time.time())}"
-        card = {
-            "token": {"symbol": "FAKE", "mint": mint, "decimals": 9},
-            "why_now": ["buyers up", "lp locked", "route stable"],
-            "score": {"total": s},
-            "plan": {"position_pct": 0.0075, "max_slippage_pct": 1.2, "expected_impact_pct": 1.3, "router": "Jupiter"},
-            "exits": {"tp_levels_pct": [50, 100, 200], "tp_allocs_pct": [25, 50, 25], "invalidation_drop_pct": 25},
-            "ops": {"pre_trade_checks": ["dust_ok"], "post_trade": ["journal"]},
-        }
-        r.set(f"card:{mint}", json.dumps(card))
-        r.zadd("candidates", {mint: s})
-        await asyncio.sleep(60)
-
+app = FastAPI()
 
 
 @app.get("/health")
 def health():
-    return {"env": {
-        "HELIUS_API_KEY": True,   # you provided: 1d1b973e-2afc-46bd-9168-6982a33b7691
-        "UPSTASH_REDIS_URL": True
-    }}
+    """
+    Basic health check + freshness check.
+    scan_seq and last_update_ms are written by loop.py
+    so you know if the feeder is still updating Redis.
+    """
+    seq = r.get("scan_seq")
+    last = r.get("last_update_ms")
+
+    return {
+        "env": {
+            "HELIUS_API_KEY": bool(os.getenv("HELIUS_API_KEY")),
+            "UPSTASH_REDIS_URL": bool(os.getenv("UPSTASH_REDIS_URL") or REDIS_URL),
+        },
+        "scan_seq": int(seq) if seq else 0,
+        "last_update_ms": int(last) if last else 0,
+    }
+
 
 @app.get("/scan")
-def scan(limit: int = 3):
-    mints = r.zrevrange("candidates", 0, limit-1)
-    return [json.loads(r.get(f"card:{m}")) for m in mints if r.get(f"card:{m}")]
+def scan(limit: int = 10):
+    """
+    Return up to `limit` best candidates ranked by score.
+    We pull the top mints from the sorted set 'candidates'
+    then load each 'card:{mint}'.
+
+    We skip anything that looks like old test data ('DUMMY...').
+    """
+    mints = r.zrevrange("candidates", 0, limit - 1)
+
+    items = []
+    for m in mints:
+        # ignore leftover fake/test keys
+        if m.startswith("DUMMY"):
+            continue
+
+        raw = r.get(f"card:{m}")
+        if not raw:
+            continue
+
+        try:
+            card = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        items.append(card)
+
+    return items
+
 
 @app.get("/evaluate")
 def evaluate(mint: str):
-    card = r.get(f"card:{mint}")
-    if card:
-        return json.loads(card)
+    """
+    Return the full card for a specific mint.
+    If it's been blocked (for example, flagged as bad),
+    return the block info.
+    """
+    raw = r.get(f"card:{mint}")
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
     block = r.get(f"block:{mint}")
-    return json.loads(block) if block else {"status": "BLOCKED", "reasons": ["not_enough_data"]}
-import os, json, time, random
+    if block:
+        try:
+            return json.loads(block)
+        except json.JSONDecodeError:
+            pass
 
-FEED_KEY = os.getenv("FEED_KEY", "")
-
+    return {"status": "BLOCKED", "reasons": ["not_enough_data"]}
