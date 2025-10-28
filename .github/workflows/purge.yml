@@ -1,0 +1,76 @@
+name: purge-old-cards
+on:
+  workflow_dispatch:
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    env:
+      UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install redis
+
+      - name: purge jupiter and dummy cards
+        run: |
+          python - << 'PYCODE'
+          import os, json, redis
+          r = redis.Redis.from_url(os.environ["UPSTASH_REDIS_URL"], decode_responses=True)
+
+          # get all candidate mints
+          mints = r.zrevrange("candidates", 0, -1)
+
+          removed = 0
+          kept = 0
+
+          for m in mints:
+              # drop obvious test keys first
+              if m.startswith("DUMMY"):
+                  r.zrem("candidates", m)
+                  r.delete(f"card:{m}")
+                  removed += 1
+                  continue
+
+              raw = r.get(f"card:{m}")
+              if not raw:
+                  r.zrem("candidates", m)
+                  continue
+
+              try:
+                  card = json.loads(raw)
+              except:
+                  r.zrem("candidates", m)
+                  r.delete(f"card:{m}")
+                  removed += 1
+                  continue
+
+              router = (
+                  card.get("plan", {}).get("router", "")
+              )
+
+              # if it's an old Jupiter-style card, purge it
+              if router == "Jupiter":
+                  r.zrem("candidates", m)
+                  r.delete(f"card:{m}")
+                  removed += 1
+              else:
+                  kept += 1
+
+          # sanity print so you can see result in the Action logs
+          print("purge complete. removed =", removed, "kept =", kept)
+
+          # optional: compact Redis sorted set to only top 200 after purge
+          # (this trims junk if there were tons of old mints)
+          fresh = r.zrevrange("candidates", 0, 199)
+          r.delete("candidates")
+          for rank, mint in enumerate(fresh):
+              # reuse score 100 - rank so we keep order descending
+              r.zadd("candidates", {mint: float(100 - rank)})
+
+          print("repacked candidates. total now =", len(fresh))
+          PYCODE
