@@ -1,7 +1,8 @@
 name: feeder
+
 on:
   schedule:
-    - cron: "*/2 * * * *"   # every 2 minutes
+    - cron: "*/2 * * * *"  # every 2 minutes
   workflow_dispatch:
 
 jobs:
@@ -11,8 +12,32 @@ jobs:
       UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
+
       - run: python -V
+
       - run: pip install requests redis
+
+      # --- DEBUG START ---
+      - name: Show ref and files
+        run: |
+          echo "REF=$GITHUB_REF SHA=$GITHUB_SHA"
+          pwd
+          ls -la
+          echo "---- head of loop.py ----"
+          sed -n '1,40p' loop.py || true
+          echo "---- any *loop*.py present ----"
+          ls -l *loop*.py || true
+          echo "---- search for 'from fastapi' anywhere ----"
+          grep -Rin "from fastapi" . || true
+          echo "---- show first 5 lines of every *loop*.py ----"
+          for f in *loop*.py; do
+            echo ">>> $f"
+            sed -n '1,8p' "$f" || true
+          done
+      # --- DEBUG END ---
+
       - run: python loop.py
