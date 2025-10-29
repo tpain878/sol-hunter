@@ -1,191 +1,247 @@
-# loop.py — single-pass writer for GitHub Actions (Axiom version)
-import os, time, json, math, requests, redis
+from fastapi import FastAPI, HTTPException
+import os, json, math, requests, redis
 from datetime import datetime, timezone
 
-REDIS_URL = os.environ["UPSTASH_REDIS_URL"]
+# --- Redis connection for /scan and /health ---
+REDIS_URL = os.getenv(
+    "UPSTASH_REDIS_URL",
+    "rediss://default:AWDJAAIncDJiYzA2YjM4NTliYzU0NzY3OWYwNzFhNzQ3YzQ4ZTBhOXAyMjQ3Nzc@keen-ferret-24777.upstash.io:6379"
+)
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-session = requests.Session()
-session.headers.update({"User-Agent":"sol-hunter-feeder/1.0"})
+app = FastAPI()
 
-DEX_SEARCH = "https://api.dexscreener.com/latest/dex/search?q=solana"
+DEX_TOKEN_ENDPOINT = "https://api.dexscreener.com/latest/dex/tokens/"
 
-def norm_pair(p: dict):
+
+def _pick_best_pool_for_mint(mint: str):
     """
-    Normalize so base token = the meme coin and quote = SOL.
-    Return mint, symbol, liquidity_usd, main_pair_url, pair_hint.
-    pair_hint is the last path segment of the Dexscreener URL.
-    """
-    base = p.get("baseToken") or {}
-    quote = p.get("quoteToken") or {}
-    b_sym = (base.get("symbol") or "").upper()
-    q_sym = (quote.get("symbol") or "").upper()
-
-    # if SOL is base and the quote is not SOL, flip them
-    if b_sym == "SOL" and q_sym != "SOL":
-        base, quote = quote, base
-        b_sym = (base.get("symbol") or "").upper()
-
-    mint = base.get("address")
-    sym  = base.get("symbol") or "UNK"
-
-    try:
-        liq = float((p.get("liquidity") or {}).get("usd") or 0)
-    except:
-        liq = 0.0
-
-    url = p.get("url") or ""
-    pair_hint = url.rsplit("/", 1)[-1] if "/" in url else url
-
-    return mint, sym, liq, url, pair_hint
-
-def score_pair(p: dict) -> int:
-    """
-    Score 1..100. Higher = more interesting.
-    Liquidity, 24h volume, and net 1h buy pressure.
-    """
-    liq = float((p.get("liquidity") or {}).get("usd") or 0)
-    vol = float((p.get("volume")   or {}).get("h24") or 0)
-    tx1 = (p.get("txns") or {}).get("h1") or {}
-    net = (tx1.get("buys") or 0) - (tx1.get("sells") or 0)
-
-    s_liq = math.log10(max(liq,1))*40          # liquidity weight
-    s_vol = math.log10(max(vol,1))*40          # volume weight
-    s_net = max(min(net,50),-50)/50*20         # buy pressure weight
-    raw = s_liq + s_vol + s_net
-
-    # clamp 1..100
-    return max(1, min(100, int(round(raw))))
-
-def fetch_pairs(limit=30):
-    """
-    Pull recent Solana pairs from Dexscreener.
-    Keep only unique mints with nonzero liquidity.
+    Query Dexscreener for this mint.
+    Return the single 'best' Solana pool dict for that mint:
+    - chainId == solana
+    - token is actually this mint
+    - choose highest liquidity_usd
+    Also return normalized fields we care about.
     """
     try:
-        d = session.get(DEX_SEARCH, timeout=10).json() or {}
-        pairs = d.get("pairs") or []
-    except:
-        return []
+        resp = requests.get(f"{DEX_TOKEN_ENDPOINT}{mint}", timeout=10)
+        data = resp.json()
+    except Exception:
+        return None
 
-    keep = []
-    seen = set()
+    pairs = data.get("pairs") or []
+    if not pairs:
+        return None
+
+    best = None
+    best_liq = 0.0
+
     for p in pairs:
+        # must be Solana
         if p.get("chainId") != "solana":
             continue
 
-        mint, sym, liq, url, pair_hint = norm_pair(p)
-        if not mint:
+        base = p.get("baseToken") or {}
+        quote = p.get("quoteToken") or {}
+
+        b_sym = (base.get("symbol") or "").upper()
+        q_sym = (quote.get("symbol") or "").upper()
+
+        # normalize so meme coin is base, not SOL
+        # if SOL is base and quote is not SOL, flip
+        if b_sym == "SOL" and q_sym != "SOL":
+            base, quote = quote, base
+
+        # we only want pools where THIS mint is the traded coin
+        if base.get("address") != mint:
             continue
-        if mint in seen:
-            continue
-        if liq <= 0:
-            continue
 
-        seen.add(mint)
+        # liquidity in USD
+        try:
+            liq_usd = float((p.get("liquidity") or {}).get("usd") or 0)
+        except Exception:
+            liq_usd = 0.0
 
-        sc = score_pair(p)
+        # pick highest liquidity
+        if liq_usd > best_liq:
+            best_liq = liq_usd
+            best = {
+                "pool": p,
+                "liq_usd": liq_usd,
+                "symbol": base.get("symbol") or "UNK",
+                "dex_url": p.get("url") or ""
+            }
 
-        # stash computed info for saving
-        p["_mint"] = mint
-        p["_sym"] = sym
-        p["_liq"] = liq
-        p["_url"] = url
-        p["_pair_hint"] = pair_hint
-        p["_score"] = sc
+    return best
 
-        keep.append(p)
 
-    # sort by score desc
-    keep.sort(key=lambda x: x["_score"], reverse=True)
-    return keep[:limit]
-
-def save_card(mint, sym, score, url, pair_hint, liq):
+def _score_pool(pool_obj: dict) -> int:
     """
-    Build the card that the API and GPT read.
-    Router is now Axiom, not Jupiter.
-    Slippage and impact are bumped for Axiom-style manual execution.
-    We also expose pair_hint so you can paste into Axiom quickly.
+    Same scoring logic as loop.py:
+    liquidity + volume + 1h net buy pressure → clamp 1..100
     """
+    p = pool_obj["pool"]
+
+    liq = float((p.get("liquidity") or {}).get("usd") or 0)
+    vol = float((p.get("volume")   or {}).get("h24") or 0)
+
+    tx1 = (p.get("txns") or {}).get("h1") or {}
+    net = (tx1.get("buys") or 0) - (tx1.get("sells") or 0)
+
+    s_liq = math.log10(max(liq, 1)) * 40
+    s_vol = math.log10(max(vol, 1)) * 40
+    s_net = max(min(net, 50), -50) / 50 * 20
+
+    raw = s_liq + s_vol + s_net
+    score_val = max(1, min(100, int(round(raw))))
+    return score_val
+
+
+def _build_execution_blocks(liquidity_usd: float):
+    """
+    Build both Axiom and Jupiter execution guidance.
+    - Axiom is considered supported if liquidity_usd > 0.
+    - Jupiter is considered supported if liquidity_usd >= 2000.
+    Slippage assumptions:
+    - Axiom: 5.0% default, manual entry, can use priority fee.
+    - Jupiter: 1.2% default, assumes a more stable route.
+    Position sizing stays 0.0075 (0.75% bankroll).
+    """
+    axiom_block = {
+        "router": "Axiom",
+        "supported": liquidity_usd > 0,
+        "slippage_pct": 5.0,
+        "position_pct": 0.0075,
+        "instructions": [
+            "Open Axiom",
+            "Search for pair_hint",
+            "Set slippage to 5.0%",
+            "Size ~0.75% of bankroll (position_pct)",
+            "Add priority fee if volume is spiking"
+        ]
+    }
+
+    jupiter_block = {
+        "router": "Jupiter",
+        "supported": liquidity_usd >= 2000,
+        "slippage_pct": 1.2,
+        "position_pct": 0.0075,
+        "instructions": [
+            "Open Jupiter",
+            "Paste the mint",
+            "Check that route is normal (no insane slippage)",
+            "If slippage > ~2-3% or route looks broken, do not trade here"
+        ]
+    }
+
+    return {
+        "axiom": axiom_block,
+        "jupiter": jupiter_block
+    }
+
+
+@app.get("/health")
+def health():
+    """
+    Basic health plus feeder freshness.
+    """
+    seq = r.get("scan_seq")
+    last = r.get("last_update_ms")
+
+    return {
+        "env": {
+            "HELIUS_API_KEY": bool(os.getenv("HELIUS_API_KEY")),
+            "UPSTASH_REDIS_URL": bool(os.getenv("UPSTASH_REDIS_URL") or REDIS_URL),
+        },
+        "scan_seq": int(seq) if seq else 0,
+        "last_update_ms": int(last) if last else 0,
+    }
+
+
+@app.get("/scan")
+def scan(limit: int = 10):
+    """
+    Ranked list from Redis.
+    This is still how you get top N plays from the feeder loop.
+    """
+    mints = r.zrevrange("candidates", 0, limit - 1)
+
+    items = []
+    for m in mints:
+        # skip obviously fake/test keys
+        if m.startswith("DUMMY"):
+            continue
+
+        raw = r.get(f"card:{m}")
+        if not raw:
+            continue
+
+        try:
+            card = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        items.append(card)
+
+    return items
+
+
+@app.get("/evaluate")
+def evaluate(mint: str):
+    """
+    Independent live evaluation for ANY mint.
+    Does NOT depend on Redis or /scan.
+    Steps:
+    - fetch best Solana pool from Dexscreener
+    - compute score
+    - build dual execution block (Axiom + Jupiter)
+    - attach exits and risk info
+    If no usable pool is found, return 404.
+    """
+
+    pool_obj = _pick_best_pool_for_mint(mint)
+    if pool_obj is None:
+        raise HTTPException(status_code=404, detail="mint not found or not tradeable on solana")
+
+    liq_usd = float(pool_obj["liq_usd"])
+    symbol = pool_obj["symbol"]
+    dex_url = pool_obj["dex_url"]
+    pair_hint = dex_url.rsplit("/", 1)[-1] if "/" in dex_url else dex_url
+
+    # score
+    score_val = _score_pool(pool_obj)
+
+    # risk flags
+    risk_notes = []
+    if liq_usd < 1000:
+        risk_notes.append("THIN_POOL_HIGH_RUG_RISK")
+
+    # execution blocks (Axiom + Jupiter)
+    exec_blocks = _build_execution_blocks(liq_usd)
+
+    # exits / plan structure for GPT
     card = {
         "token": {
-            "symbol": sym,
+            "symbol": symbol,
             "mint": mint,
             "decimals": 9
         },
-        "why_now": [
-            "route stable"
-        ],
         "score": {
-            "total": score
+            "total": score_val
         },
-        "plan": {
-            # starter position sizing: ~0.75% of bankroll
-            "position_pct": 0.0075,
-
-            # Axiom flow often uses higher slippage to actually get filled
-            # on new thin pools, and may add priority fee.
-            "max_slippage_pct": 5.0,
-            "expected_impact_pct": 5.0,
-
-            # tell the GPT and you which venue to use
-            "router": "Axiom",
-
-            # give user manual reminders for how to execute in Axiom
-            "execution_notes": [
-                "open Axiom and paste pair_hint",
-                "use priority fee if volume is spiking",
-                "size with position_pct of bankroll"
-            ]
-        },
-        "exits": {
-            # take-profit ladder in % gain from entry
-            "tp_levels_pct": [50, 100, 200],
-            # how much to unload at each TP
-            "tp_allocs_pct": [25, 50, 25],
-
-            # invalidation cutoff. if price nukes this % below entry,
-            # assume thesis is dead
-            "invalidation_drop_pct": 25
-        },
-        "ops": {
-            "pre_trade_checks": ["dust_ok"],
-            "post_trade": ["journal"]
-        },
-        "refs": {
-            # dexscreener page to inspect tape and liquidity
-            "dex": url,
-            # this is the pool / pair id (last path segment) so you can
-            # search quickly in Axiom
+        "market": {
+            "liquidity_usd": liq_usd,
+            "dex_url": dex_url,
             "pair_hint": pair_hint,
-            # surface liquidity for fast sanity check before you ape
-            "liquidity_usd": liq
+            "risk": risk_notes,
+            "asof": datetime.now(timezone.utc).isoformat()
         },
-        # timestamp so GPT and you can tell how fresh this card is
-        "asof": datetime.now(timezone.utc).isoformat()
+        "execution": exec_blocks,
+        "exits": {
+            "tp_levels_pct": [50, 100, 200],
+            "tp_allocs_pct": [25, 50, 25],
+            "invalidation_drop_pct": 25
+        }
     }
 
-    r.set(f"card:{mint}", json.dumps(card))
-    r.zadd("candidates", {mint: float(score)})
-
-def main():
-    wrote = 0
-    for p in fetch_pairs(limit=30):
-        save_card(
-            p["_mint"],
-            p["_sym"],
-            p["_score"],
-            p["_url"],
-            p["_pair_hint"],
-            p["_liq"]
-        )
-        wrote += 1
-
-    # freshness beacons so /health and GPT can tell data is live
-    r.set("last_update_ms", int(time.time() * 1000))
-    r.incr("scan_seq")
-
-    print(f"wrote={wrote}")
-
-if __name__ == "__main__":
-    main()
+    return card
